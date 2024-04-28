@@ -1,10 +1,8 @@
 use libc::dup;
 use pyo3::prelude::*;
 use pyo3::PyObject;
-use std::io::ErrorKind;
-use std::os::fd;
-use std::os::fd::FromRawFd;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, RawFd};
+use std::fs::File;
 use std::net::{TcpStream, UdpSocket};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use thiserror::Error as ThisError;
@@ -23,7 +21,6 @@ const FILE_TYPES: [&str; 4] = [
 /// Socket family constants
 const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
-// const AF_INET6: i32 = 30;
 
 /// Socket type constants
 const SOCK_STREAM: i32 = 1;
@@ -38,10 +35,50 @@ pub enum Error {
     PyError(#[from] PyErr),
 }
 
-trait PyFileObject {
-    fn fileno(&self) -> Result<RawFd, Error>;
+/// A trait to implement for wrapping types that represent Python file like objects.
+/// These types can then be used to implement the `FromPyFileObject` trait to convert
+/// the Python object to a Rust file like object.
+///
+/// use pyo3::prelude::*;
+/// use pyo3::PyObject;
+/// use std::net::TcpStream;
+///
+/// struct ProcessStdout {
+///    obj: PyObject,
+/// }
+///
+/// impl ProcessStdout {
+///     pub fn new(obj: PyObject) -> Self {
+///         Self { obj }
+///     }
+/// }
+///
+/// impl pyo3_fd::PyFileObject for ProcessStdout {
+///     fn verify(&self) -> Result<(), pyo3_fd::Error> {
+///         let typ = pyo3_fd::get_py_type_name(self.as_object())?;
+///         if typ != "BufferedReader" {
+///             return Err(pyo3_fd::Error::Error("Not a ProcessStdout object".to_string()));
+///         }
+///         Ok(())
+///     }
+///     fn as_object(&self) -> &PyObject {
+///         &(*self).obj
+///     }
+/// }
+///
+/// impl pyo3_fd::FromPyFileObject<ProcessStdout> for UnixStream {}
+pub trait PyFileObject {
+    fn fileno(&self) -> Result<RawFd, Error> {
+        get_py_fd(self.as_object())
+    }
+
+    fn verify(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     fn as_object(&self) -> &PyObject;
 }
+
 
 /// A trait used to define behavior for converting a Python file like object to a Rust file like object.
 ///
@@ -51,17 +88,19 @@ trait PyFileObject {
 /// to call dup here to ensure that the file descriptor owned by the Python object is
 /// not closed when our F object is dropped.
 ///
-/// This trait offers two methods, `from_py_fd_unchecked` and `from_py_fd`. The former
+/// This trait offers two methods, `try_from_py_fd_unchecked` and `try_from_py_fd`. The former
 /// is unsafe because the caller is responsible for ensuring that the correct rust type
-/// is being created from the Python object. The latter is safe as it fill perform
+/// is being created from the Python object. The latter is meant to safe as it will perform
 /// additional checks to ensure that the Python object is of the correct type for the
-/// Rust object being created.
+/// Rust object being created. However the checks are still the responsibility of the implementor
+/// Since the type from which the file descriptor is being duplicated is
+/// only known by the implementor.
 trait FromPyFileObject<Input>: FromRawFd + Sized
 where Input: PyFileObject
 {
-    unsafe fn from_py_fd_unchecked(input: Input) -> Result<Self, Error> {
+    unsafe fn try_from_py_fd_unchecked(input: Input) -> Result<Self, Error> {
         let pyfd = Python::with_gil(|_| input.fileno())?;
-        let duped: fd::RawFd = dup(pyfd);
+        let duped: RawFd = dup(pyfd);
         if duped < 0 {
             return Err(Error::Error(
                 "Failed to duplicate file descriptor".to_string(),
@@ -71,11 +110,16 @@ where Input: PyFileObject
         Ok(f)
     }
 
-    fn from_py_fd(input: Input) -> Result<Self, Error>;
+    fn try_from_py_fd(input: Input) -> Result<Self, Error> {
+        input.verify()?;
+        unsafe { <Self as FromPyFileObject<_>>::try_from_py_fd_unchecked(input) }
+    }
 }
 
+// Helper functions for various operations dealing with Python objects
+
 /// Helper function to get the name of the Python type of an object
-fn get_py_type_name(obj: &PyObject) -> Result<String, Error> {
+pub fn get_py_type_name(obj: &PyObject) -> Result<String, Error> {
     Python::with_gil(|py| {
         let class = obj.getattr(py, "__class__")?;
         let name: Py<_> = class.getattr(py, "__name__")?;
@@ -94,117 +138,48 @@ fn get_py_fd(obj: &PyObject) -> Result<RawFd, Error> {
     })
 }
 
-macro_rules! impl_py_file_object {
-    ($t:ty) => {
+/// Helper function to extract socket characteristics from a Python socket object
+fn get_sock_characteristics(obj: &PyObject) -> Result<(RawFd, String, i32, i32), Error> {
+    Python::with_gil(|py| {
+        let fileno = obj.getattr(py, "fileno")?;
+        let fd: RawFd = fileno.call0(py)?.extract::<RawFd>(py)?;
+        let family: i32 = obj.getattr(py, "family")?.extract::<i32>(py)?;
+        let socktype: i32 = obj.getattr(py, "type")?.extract::<i32>(py)?;
+        let typ = get_py_type_name(obj)?;
+        Ok((fd, typ, family, socktype))
+    })
+}
 
-        impl $t {
+
+/// Implement the PyFileObject trait for a given wrapper type using the provided verification function
+macro_rules! impl_py_file_object {
+    ($input:ident, $f:ident) => {
+        pub struct $input {
+            obj: PyObject,
+        }
+
+        impl $input {
             pub fn new(obj: PyObject) -> Self {
                 Self { obj }
             }
         }
 
-
-        impl PyFileObject for $t {
-            fn fileno(&self) -> Result<RawFd, Error> {
-                get_py_fd(&self.obj)
-            }
-
+        impl PyFileObject for $input {
             fn as_object(&self) -> &PyObject {
                 &(*self).obj
             }
-        }
-    };
-}
 
-pub struct PyUnixDatagram {
-    obj: PyObject,
-}
-
-impl_py_file_object!(PyUnixDatagram);
-
-pub struct PyUnixStream {
-    obj: PyObject,
-}
-
-impl_py_file_object!(PyUnixStream);
-
-pub struct PyTcpStream {
-    obj: PyObject,
-}
-
-impl_py_file_object!(PyTcpStream);
-
-pub struct PyUdpSocket {
-    obj: PyObject,
-}
-
-impl_py_file_object!(PyUdpSocket);
-
-pub struct PyFile {
-    obj: PyObject,
-}
-
-impl_py_file_object!(PyFile);
-
-
-macro_rules! impl_from_py_fd {
-    ($input:ty, $output:ty, $verify:ident) => {
-        impl FromPyFileObject<$input> for $output {
-            fn from_py_fd(input: $input) -> Result<Self, Error> {
-                Python::with_gil(|py| {
-                    let obj = input.as_object();
-                    let typ = get_py_type_name(obj)?;
-                    let family = obj.getattr(py, "family")?.extract::<i32>(py)?;
-                    let socktype = obj.getattr(py, "type")?.extract::<i32>(py)?;
-                    let fd = get_py_fd(obj)?;
-                    $verify(fd, typ, family, socktype)
-                })?;
-                unsafe { <$output as FromPyFileObject<_>>::from_py_fd_unchecked(input) }
+            fn verify(&self) -> Result<(), Error> {
+                $f(self)
             }
         }
     };
 }
 
-/// Verify the characteristics of a TCP socket object
-fn verify_tcp_stream(fd: RawFd, typ: String, family: i32, socktype: i32) -> Result<(), Error> {
-    if fd < 0 {
-        return Err(Error::Error("Invalid file descriptor".to_string()));
-    }
-    if typ != SOCKET {
-        return Err(Error::Error("Not a socket object".to_string()));
-    }
-    if family != AF_INET {
-        return Err(Error::Error("Not an AF_INET socket".to_string()));
-    }
-    if socktype != SOCK_STREAM {
-        return Err(Error::Error("Not a SOCK_STREAM socket".to_string()));
-    }
-    Ok(())
-}
-
-impl_from_py_fd!(PyTcpStream, TcpStream, verify_tcp_stream);
-
-/// Veify the characteristics of a UDP socket object
-fn verify_udp_stream(fd: RawFd, typ: String, family: i32, socktype: i32) -> Result<(), Error> {
-    if fd < 0 {
-        return Err(Error::Error("Invalid file descriptor".to_string()));
-    }
-    if typ != SOCKET {
-        return Err(Error::Error("Not a socket object".to_string()));
-    }
-    if family != AF_INET {
-        return Err(Error::Error("Not an AF_INET socket".to_string()));
-    }
-    if socktype != SOCK_DGRAM {
-        return Err(Error::Error("Not a SOCK_DGRAM socket".to_string()));
-    }
-    Ok(())
-}
-
-impl_from_py_fd!(PyUdpSocket, UdpSocket, verify_udp_stream);
 
 /// Verify the characteristics of a Unix Datagram socket object
-fn verify_unix_datagram(fd: RawFd, typ: String, family: i32, socktype: i32) -> Result<(), Error> {
+fn verify_unix_datagram<O: PyFileObject>(obj: &O) -> Result<(), Error> {
+    let (fd, typ, family, socktype) = get_sock_characteristics(obj.as_object())?;
     if fd < 0 {
         return Err(Error::Error("Invalid file descriptor".to_string()));
     }
@@ -220,10 +195,12 @@ fn verify_unix_datagram(fd: RawFd, typ: String, family: i32, socktype: i32) -> R
     Ok(())
 }
 
-impl_from_py_fd!(PyUnixDatagram, UnixDatagram, verify_unix_datagram);
+impl_py_file_object!(PyUnixDatagramSocket, verify_unix_datagram);
+
 
 /// Verify the characteristics of a Unix Stream socket object
-fn verify_unix_stream(fd: RawFd, typ: String, family: i32, socktype: i32) -> Result<(), Error> {
+fn verify_unix_stream<O: PyFileObject>(obj: &O) -> Result<(), Error> {
+    let (fd, typ, family, socktype) = get_sock_characteristics(obj.as_object())?;
     if fd < 0 {
         return Err(Error::Error("Invalid file descriptor".to_string()));
     }
@@ -239,36 +216,76 @@ fn verify_unix_stream(fd: RawFd, typ: String, family: i32, socktype: i32) -> Res
     Ok(())
 }
 
-impl_from_py_fd!(PyUnixStream, UnixStream, verify_unix_stream);
+impl_py_file_object!(PyUnixStreamSocket, verify_unix_stream);
+
+
+/// Verify the characteristics of a TCP socket object
+fn verify_tcp_stream<O: PyFileObject>(obj: &O) -> Result<(), Error> {
+    let (fd, typ, family, socktype) = get_sock_characteristics(obj.as_object())?;
+    if fd < 0 {
+        return Err(Error::Error("Invalid file descriptor".to_string()));
+    }
+    if typ != SOCKET {
+        return Err(Error::Error("Not a socket object".to_string()));
+    }
+    if family != AF_INET {
+        return Err(Error::Error("Not an AF_INET socket".to_string()));
+    }
+    if socktype != SOCK_STREAM {
+        return Err(Error::Error("Not a SOCK_STREAM socket".to_string()));
+    }
+    Ok(())
+}
+
+impl_py_file_object!(PyTcpStreamSocket, verify_tcp_stream);
+
+
+/// Veify the characteristics of a UDP socket object
+fn verify_udp_stream<O: PyFileObject>(obj: &O) -> Result<(), Error> {
+    let (fd, typ, family, socktype) = get_sock_characteristics(obj.as_object())?;
+    if fd < 0 {
+        return Err(Error::Error("Invalid file descriptor".to_string()));
+    }
+    if typ != SOCKET {
+        return Err(Error::Error("Not a socket object".to_string()));
+    }
+    if family != AF_INET {
+        return Err(Error::Error("Not an AF_INET socket".to_string()));
+    }
+    if socktype != SOCK_DGRAM {
+        return Err(Error::Error("Not a SOCK_DGRAM socket".to_string()));
+    }
+    Ok(())
+}
+
+impl_py_file_object!(PyUdpSocket, verify_udp_stream);
+
 
 /// Verify the characteristics of a file object
-fn verify_file(fd: RawFd, typ: &str, additional_file_types: Option<&[&str]>) -> Result<(), Error> {
+fn verify_file<O: PyFileObject>(obj: &O) -> Result<(), Error> {
+    let obj = obj.as_object();
+    let typ = get_py_type_name(obj)?;
+    let fd = get_py_fd(obj)?;
     if fd < 0 {
         return Err(Error::Error("Invalid file descriptor".to_string()));
     }
 
-    if FILE_TYPES.contains(&typ) {
+    if FILE_TYPES.contains(&typ.as_str()) {
         return Ok(());
-    }
-
-    if let Some(additional_file_types) = additional_file_types {
-        if additional_file_types.contains(&typ) {
-            return Ok(());
-        }
     }
 
     Err(Error::Error("Not a file object".to_string()))
 }
 
-impl FromPyFileObject<PyFile> for std::fs::File {
-    fn from_py_fd(input: PyFile) -> Result<Self, Error> {
-        let obj = input.as_object();
-        let typ = get_py_type_name(obj)?;
-        let fd = get_py_fd(obj)?;
-        verify_file(fd, &typ, None)?;
-        unsafe { std::fs::File::from_py_fd_unchecked(input) }
-    }
-}
+impl_py_file_object!(PyFile, verify_file);
+
+
+impl FromPyFileObject<PyUnixDatagramSocket> for UnixDatagram {}
+impl FromPyFileObject<PyUnixStreamSocket> for UnixStream {}
+impl FromPyFileObject<PyTcpStreamSocket> for TcpStream {}
+impl FromPyFileObject<PyUdpSocket> for UdpSocket {}
+impl FromPyFileObject<PyFile> for File {}
+
 
 #[cfg(test)]
 mod tests {
@@ -321,7 +338,7 @@ mod tests {
         });
 
         let input = PyFile::new(stdout_obj);
-        let stdout_res = unsafe { File::from_py_fd_unchecked(input) };
+        let stdout_res = unsafe { File::try_from_py_fd_unchecked(input) };
 
         assert!(stdout_res.is_ok());
         let mut stdout: File = stdout_res.unwrap();
@@ -339,13 +356,13 @@ mod tests {
             (tx.to_object(py), rx.to_object(py))
         });
 
-        let tx_input = PyUnixDatagram::new(tx_obj);
-        let rx_input = PyUnixDatagram::new(rx_obj);
+        let tx_input = PyUnixDatagramSocket::new(tx_obj);
+        let rx_input = PyUnixDatagramSocket::new(rx_obj);
 
         let (tx_res, rx_res) = unsafe {
             (
-                UnixDatagram::from_py_fd_unchecked(tx_input),
-                UnixDatagram::from_py_fd_unchecked(rx_input),
+                UnixDatagram::try_from_py_fd_unchecked(tx_input),
+                UnixDatagram::try_from_py_fd_unchecked(rx_input),
             )
         };
 
@@ -369,13 +386,13 @@ mod tests {
             (tx.to_object(py), rx.to_object(py))
         });
 
-        let tx_input = PyUnixStream::new(tx_obj);
-        let rx_input = PyUnixStream::new(rx_obj);
+        let tx_input = PyUnixStreamSocket::new(tx_obj);
+        let rx_input = PyUnixStreamSocket::new(rx_obj);
 
         let (tx_res, rx_res) = unsafe {
             (
-                UnixStream::from_py_fd_unchecked(tx_input),
-                UnixStream::from_py_fd_unchecked(rx_input),
+                UnixStream::try_from_py_fd_unchecked(tx_input),
+                UnixStream::try_from_py_fd_unchecked(rx_input),
             )
         };
 
@@ -404,9 +421,9 @@ mod tests {
             created_sock.to_object(py)
         });
 
-        let input = PyTcpStream::new(sock_obj);
+        let input = PyTcpStreamSocket::new(sock_obj);
 
-        let stream_res = unsafe { TcpStream::from_py_fd_unchecked(input) };
+        let stream_res = unsafe { TcpStream::try_from_py_fd_unchecked(input) };
         assert!(stream_res.is_ok());
         let mut stream = stream_res.unwrap();
         assert!(stream.write_all(b"Hello, world!\n").is_ok());
@@ -433,7 +450,7 @@ mod tests {
 
         let input = PyUdpSocket::new(sock_obj);
 
-        let dgram_res = unsafe { UdpSocket::from_py_fd_unchecked(input) };
+        let dgram_res = unsafe { UdpSocket::try_from_py_fd_unchecked(input) };
         assert!(dgram_res.is_ok());
         let dgram = dgram_res.unwrap();
         assert!(dgram.send(b"Hello, world!\n").is_ok());
@@ -452,7 +469,7 @@ mod tests {
         });
 
         let input = PyFile::new(stdout_obj);
-        let stdout_res = File::from_py_fd(input);
+        let stdout_res = File::try_from_py_fd(input);
 
         assert!(stdout_res.is_ok());
         let mut stdout: File = stdout_res.unwrap();
@@ -471,7 +488,7 @@ mod tests {
         });
 
         let input = PyFile::new(tx_obj);
-        let file_res = File::from_py_fd(input);
+        let file_res = File::try_from_py_fd(input);
         assert!(!file_res.is_ok());
     }
 
@@ -486,12 +503,12 @@ mod tests {
             (tx.to_object(py), rx.to_object(py))
         });
 
-        let tx_input = PyUnixDatagram::new(tx_obj);
-        let rx_input = PyUnixDatagram::new(rx_obj);
+        let tx_input = PyUnixDatagramSocket::new(tx_obj);
+        let rx_input = PyUnixDatagramSocket::new(rx_obj);
 
         let (tx_res, rx_res) = (
-            UnixDatagram::from_py_fd(tx_input),
-            UnixDatagram::from_py_fd(rx_input),
+            UnixDatagram::try_from_py_fd(tx_input),
+            UnixDatagram::try_from_py_fd(rx_input),
         );
 
         assert!(tx_res.is_ok());
@@ -512,9 +529,9 @@ mod tests {
             stdout.to_object(py)
         });
 
-        let input = PyUnixDatagram::new(stdout_obj);
+        let input = PyUnixDatagramSocket::new(stdout_obj);
 
-        let stdout_res = UnixDatagram::from_py_fd(input);
+        let stdout_res = UnixDatagram::try_from_py_fd(input);
         assert!(!stdout_res.is_ok());
     }
 
@@ -529,12 +546,12 @@ mod tests {
             (tx.to_object(py), rx.to_object(py))
         });
 
-        let tx_input = PyUnixStream::new(tx_obj);
-        let rx_input = PyUnixStream::new(rx_obj);
+        let tx_input = PyUnixStreamSocket::new(tx_obj);
+        let rx_input = PyUnixStreamSocket::new(rx_obj);
 
         let (tx_res, rx_res) = (
-            UnixStream::from_py_fd(tx_input),
-            UnixStream::from_py_fd(rx_input),
+            UnixStream::try_from_py_fd(tx_input),
+            UnixStream::try_from_py_fd(rx_input),
         );
 
         assert!(tx_res.is_ok());
@@ -555,9 +572,9 @@ mod tests {
             stdout.to_object(py)
         });
 
-        let input = PyUnixStream::new(stdout_obj);
+        let input = PyUnixStreamSocket::new(stdout_obj);
 
-        let stdout_res = UnixStream::from_py_fd(input);
+        let stdout_res = UnixStream::try_from_py_fd(input);
         assert!(!stdout_res.is_ok());
     }
 
@@ -577,9 +594,9 @@ mod tests {
             created_sock.to_object(py)
         });
 
-        let input = PyTcpStream::new(sock_obj);
+        let input = PyTcpStreamSocket::new(sock_obj);
 
-        let stream_res = TcpStream::from_py_fd(input);
+        let stream_res = TcpStream::try_from_py_fd(input);
         assert!(stream_res.is_ok());
         let mut stream = stream_res.unwrap();
         assert!(stream.write_all(b"Hello, world!\n").is_ok());
@@ -597,9 +614,9 @@ mod tests {
             stdout.to_object(py)
         });
 
-        let input = PyTcpStream::new(stdout_obj);
+        let input = PyTcpStreamSocket::new(stdout_obj);
 
-        let stdout_res = TcpStream::from_py_fd(input);
+        let stdout_res = TcpStream::try_from_py_fd(input);
         assert!(!stdout_res.is_ok());
     }
 
@@ -621,7 +638,7 @@ mod tests {
 
         let input = PyUdpSocket::new(sock_obj);
 
-        let dgram_res = UdpSocket::from_py_fd(input);
+        let dgram_res = UdpSocket::try_from_py_fd(input);
         assert!(dgram_res.is_ok());
         let dgram = dgram_res.unwrap();
         assert!(dgram.send(b"Hello, world!\n").is_ok());
@@ -641,7 +658,7 @@ mod tests {
 
         let input = PyUdpSocket::new(stdout_obj);
 
-        let stdout_res = UdpSocket::from_py_fd(input);
+        let stdout_res = UdpSocket::try_from_py_fd(input);
         assert!(!stdout_res.is_ok());
     }
 }
